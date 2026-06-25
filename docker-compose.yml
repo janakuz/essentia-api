@@ -1,0 +1,13 @@
+services:
+  analyzer-service:
+    build: .
+    container_name: audio-analyzer
+    ports:
+      - "8000:8000"
+    environment:
+      - AUDIO_API_KEY=${AUDIO_API_KEY}
+      - TF_CPP_MIN_LOG_LEVEL=${TF_CPP_MIN_LOG_LEVEL}
+      - TF_ENABLE_ONEDNN_OPTS=${TF_ENABLE_ONEDNN_OPTS}
+    volumes:
+      - ${HOST_MODELS_PATH}:/app/model_weights:ro
+    restart: unless-stopped
