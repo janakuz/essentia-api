@@ -32,6 +32,9 @@ models = dict()
 basic_features = dict()
 class_labels = dict()
 
+loader = es.AudioLoader()
+mono_mixer = es.MonoMixer()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     embedding_model_effnet = es.TensorflowPredictEffnetDiscogs(graphFilename="model_weights/discogs-effnet-bs64-1.pb", output="PartitionedCall:1")
@@ -86,8 +89,9 @@ async def analyze(file: UploadFile):
     with open(temp_path, "wb") as f:
         f.write(await file.read())
 
-    audio_data, native_sr, num_channels, _, _, _ = es.AudioLoader(filename=temp_path)()
-    audio = es.MonoMixer()(audio_data, num_channels)
+    loader.configure(filename=temp_path)
+    audio_data, native_sr, num_channels, _, _, _ = loader()
+    audio = mono_mixer(audio_data, num_channels)
 
     res = dict()
     
@@ -138,7 +142,7 @@ async def analyze(file: UploadFile):
     
     energy_drop_ratio = side_energy / (total_energy + 1e-6)    
 
-    instrumental = True if energy_drop_ratio > 1.0 else False
+    instrumental = True if energy_drop_ratio > 1.0 and num_channels == 2 else False
 
 
     if not instrumental:
