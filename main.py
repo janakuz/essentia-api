@@ -4,6 +4,7 @@ import os
 import sys
 import json
 import heapq
+import time
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -29,7 +30,6 @@ async def validate_api_key(api_key: str = Depends(api_key_header)):
 
 embedding_models = dict()
 models = dict()
-basic_features = dict()
 class_labels = dict()
 
 loader = es.AudioLoader()
@@ -59,11 +59,6 @@ async def lifespan(app: FastAPI):
     models["voice_gender"] = es.TensorflowPredict2D(graphFilename="model_weights/gender-discogs-effnet-1.pb", output="model/Softmax")
     models["jamendo_instruments"] = es.TensorflowPredict2D(graphFilename="model_weights/mtg_jamendo_instrument-discogs-effnet-1.pb")
 
-    basic_features["bpm"] = es.RhythmExtractor2013(maxTempo = 250)
-    basic_features["key"] = es.KeyExtractor()
-    basic_features["loudness"] = es.LoudnessEBUR128()
-    basic_features["dynamic"] = es.DynamicComplexity()
-
     with open('model_weights/mtg_jamendo_moodtheme-discogs-effnet-1.json', 'r') as f:
         metadata = json.load(f)
         class_labels["mtg"] = metadata['classes']
@@ -75,8 +70,6 @@ async def lifespan(app: FastAPI):
 
     embedding_models.clear()
     models.clear()
-    basic_features.clear()
-
 
 app = FastAPI(lifespan=lifespan, dependencies=[Depends(validate_api_key)])
 
@@ -85,25 +78,42 @@ async def analyze(file: UploadFile):
     if not file.filename.endswith(('.mp3', '.wav', '.flac', '.m4a', '.aac')):
         raise HTTPException(status_code=400, detail="Unsupported audio format")
     
+    timings = {}
+
+    start_upload = time.perf_counter()
+
     temp_path = f"/tmp/{file.filename}"
     with open(temp_path, "wb") as f:
         f.write(await file.read())
+
+    timings["upload_and_save"] = time.perf_counter() - start_upload
+
+    start_load = time.perf_counter()
 
     loader.configure(filename=temp_path)
     audio_data, native_sr, num_channels, _, _, _ = loader()
     audio = mono_mixer(audio_data, num_channels)
 
+    timings["load"] = time.perf_counter() - start_load
+
     res = dict()
     
-    bpm, _, _, _,  _ = basic_features["bpm"](audio)
-    key, scale, _ = basic_features["key"](audio)
-    _, _, integrated_loudness, _ = basic_features["loudness"](audio_data)
-    dynamic_complexity, _ = basic_features["dynamic"](audio)
+    bpm_extractor = es.PercivalBpmEstimator(maxBPM=250)
+    key_extracor = es.KeyExtractor()
+    loudness_extractor = es.LoudnessEBUR128()
+    dynamic_complexity_extractor = es.DynamicComplexity()
+
+
+    bpm = bpm_extractor(audio)
+    key, scale, _ = key_extracor(audio)
+    _, _, integrated_loudness, _ = loudness_extractor(audio_data)
+    dynamic_complexity, _ = dynamic_complexity_extractor(audio)
 
     res["bpm"] = bpm
     res["key"] = {"key": key, "scale":scale}
     res["loudness"] = integrated_loudness
     res["dynamic_complexity"] = dynamic_complexity
+
 
     target_sr = 16000
     if native_sr != target_sr:
@@ -186,7 +196,6 @@ async def analyze(file: UploadFile):
 
     if os.path.exists(temp_path):
         os.remove(temp_path)
-
 
     return res
 
