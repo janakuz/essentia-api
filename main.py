@@ -1,10 +1,11 @@
 import numpy as np
-import essentia.standard as es
 import os
-import sys
 import json
-import heapq
-import time
+from pathlib import Path
+import zipfile
+import shutil
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -28,15 +29,33 @@ async def validate_api_key(api_key: str = Depends(api_key_header)):
     )
 
 
+es = None
+
+dsp = dict()
 embedding_models = dict()
 models = dict()
 class_labels = dict()
 
-loader = es.AudioLoader()
-mono_mixer = es.MonoMixer()
+loader = None
+mono_mixer = None
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+
+def init_worker_process():
+    global es, loader, mono_mixer, embedding_models, models, class_labels, dsp
+    import essentia.standard as local_es
+    import essentia
+    essentia.EssentiaLogger().warningActive = False
+
+    es = local_es
+
+    loader = es.AudioLoader()
+    mono_mixer = es.MonoMixer()
+
+    dsp["bpm_extractor"] = es.PercivalBpmEstimator(maxBPM=250)
+    dsp["key_extractor"] = es.KeyExtractor()
+    dsp["loudness_extractor"] = es.LoudnessEBUR128()
+    dsp["dynamic_complexity_extractor"] = es.DynamicComplexity()
+    
     embedding_model_effnet = es.TensorflowPredictEffnetDiscogs(graphFilename="model_weights/discogs-effnet-bs64-1.pb", output="PartitionedCall:1")
     embedding_model_vggish = es.TensorflowPredictVGGish(graphFilename="model_weights/audioset-vggish-3.pb", output="model/vggish/embeddings")
     embedding_models["effnet"] = embedding_model_effnet
@@ -65,49 +84,41 @@ async def lifespan(app: FastAPI):
 
     class_labels["mirex"] = ["boisterous", "cheerful", "poignant", "humorous", "aggressive"]
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    global process_executor
+
+    ctx = multiprocessing.get_context("spawn")
+
+    process_executor = ProcessPoolExecutor(max_workers=max(1, os.cpu_count()), 
+                                           initializer=init_worker_process,
+                                           mp_context=ctx,
+                                           max_tasks_per_child=None)
+
 
     yield
 
-    embedding_models.clear()
-    models.clear()
+    process_executor.shutdown(wait=True)
 
 app = FastAPI(lifespan=lifespan, dependencies=[Depends(validate_api_key)])
 
-@app.post("/analyze")
-async def analyze(file: UploadFile):
-    if not file.filename.endswith(('.mp3', '.wav', '.flac', '.m4a', '.aac')):
-        raise HTTPException(status_code=400, detail="Unsupported audio format")
-    
-    timings = {}
 
-    start_upload = time.perf_counter()
-
-    temp_path = f"/tmp/{file.filename}"
-    with open(temp_path, "wb") as f:
-        f.write(await file.read())
-
-    timings["upload_and_save"] = time.perf_counter() - start_upload
-
-    start_load = time.perf_counter()
-
+def process_single_file(temp_path: str):
     loader.configure(filename=temp_path)
     audio_data, native_sr, num_channels, _, _, _ = loader()
     audio = mono_mixer(audio_data, num_channels)
 
-    timings["load"] = time.perf_counter() - start_load
-
     res = dict()
+    res["track_id"] = int(temp_path.split("/")[-1].split(".")[0])
     
-    bpm_extractor = es.PercivalBpmEstimator(maxBPM=250)
-    key_extracor = es.KeyExtractor()
-    loudness_extractor = es.LoudnessEBUR128()
-    dynamic_complexity_extractor = es.DynamicComplexity()
 
 
-    bpm = bpm_extractor(audio)
-    key, scale, _ = key_extracor(audio)
-    _, _, integrated_loudness, _ = loudness_extractor(audio_data)
-    dynamic_complexity, _ = dynamic_complexity_extractor(audio)
+
+    bpm = dsp["bpm_extractor"](audio)
+    key, scale, _ = dsp["key_extractor"](audio)
+    _, _, integrated_loudness, _ = dsp["loudness_extractor"](audio_data)
+    dynamic_complexity, _ = dsp["dynamic_complexity_extractor"](audio)
 
     res["bpm"] = bpm
     res["key"] = {"key": key, "scale":scale}
@@ -138,10 +149,6 @@ async def analyze(file: UploadFile):
     res["mood_relaxed"] = np.mean(models["mood_relaxed"](embeddings_effnet), axis=0)[1].item()
     res["mood_sad"] = np.mean(models["mood_sad"](embeddings_effnet), axis=0)[1].item()
 
-    # pred_instrumental = np.mean(models["instrumental"](embeddings_effnet), axis=0)[0].item()
-    # instrumental = True if pred_instrumental > 0.7 else False
-    # res["pred_inst"] = pred_instrumental
-
     left_channel = audio_data[:, 0]
     right_channel = audio_data[:, 1]
     
@@ -163,13 +170,11 @@ async def analyze(file: UploadFile):
         median_male_prob = np.median(male_probabilities)
 
 
-        # res["mean"] = mean_male_prob.item()
         mid_zone_frames = np.sum((male_probabilities >= 0.35) & (male_probabilities <= 0.65)) / len(male_probabilities)
 
         if std_dev >= 0.2 and mid_zone_frames < 0.25:
             res["voice"] = "mixed"
         else:
-#            mean_voice = np.mean(voice_preds, axis=0)
             median_male_prob = np.median(male_probabilities)
             res["voice"] = "male" if median_male_prob > 0.7 else "female"
     
@@ -194,11 +199,45 @@ async def analyze(file: UploadFile):
 
     res["moods"] = moods_mtg + moods_mirex
 
-    if os.path.exists(temp_path):
-        os.remove(temp_path)
-
     return res
 
+
+
+@app.post("/analyze-batch")
+async def analyze(file: UploadFile):
+    if not file.filename.endswith('.zip'):
+        raise HTTPException(status_code=400, detail="This endpoint expects a .zip file")
+        
+    upload_dir = Path(f"/tmp/zip_{os.getpid()}_{file.filename.replace('.', '_')}")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    
+    zip_path = upload_dir / "uploaded.zip"
+    
+    with open(zip_path, "wb") as f:
+        f.write(file.file.read())
+        
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(upload_dir)
+        
+    supported_extensions = ('.mp3', '.wav', '.flac', '.m4a', '.aac', '.wma')
+    audio_paths = [
+        str(p) for p in upload_dir.glob("**/*") 
+        if p.is_file() and p.suffix.lower() in supported_extensions
+    ]
+    
+    if not audio_paths:
+        shutil.rmtree(upload_dir)
+        raise HTTPException(status_code=400, detail="No valid files in zip archive.")
+        
+    try:
+        results_iterator = process_executor.map(process_single_file, audio_paths)
+        final_results = list(results_iterator)
+        
+        return {"status": "success", "results": final_results}
+        
+    finally:
+        if upload_dir.exists():
+            shutil.rmtree(upload_dir)
 
 
 
