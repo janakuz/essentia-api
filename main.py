@@ -5,9 +5,12 @@ from pathlib import Path
 import zipfile
 import shutil
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import essentia.standard as es
 from dotenv import load_dotenv
 load_dotenv()
+
+import time
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException, Security, Depends
@@ -18,8 +21,6 @@ API_KEY_NAME = "X-API-KEY"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 EXPECTED_API_KEY = os.environ["AUDIO_API_KEY"]
 
-
-
 async def validate_api_key(api_key: str = Depends(api_key_header)):
     if api_key == EXPECTED_API_KEY:
         return api_key
@@ -28,34 +29,37 @@ async def validate_api_key(api_key: str = Depends(api_key_header)):
         detail="Unauthorized: Invalid or missing API Key."
     )
 
-
-es = None
-
 dsp = dict()
 embedding_models = dict()
 models = dict()
 class_labels = dict()
 
-loader = None
-mono_mixer = None
+# loader = None
+# mono_mixer = None
+process_executor = None
 
 
-def init_worker_process():
-    global es, loader, mono_mixer, embedding_models, models, class_labels, dsp
-    import essentia.standard as local_es
-    import essentia
-    essentia.EssentiaLogger().warningActive = False
+# def init_worker_process():
+#     global es
+#     import essentia.standard as local_es
+#     import essentia
+#     essentia.EssentiaLogger().warningActive = False
 
-    es = local_es
-
-    loader = es.AudioLoader()
-    mono_mixer = es.MonoMixer()
-
-    dsp["bpm_extractor"] = es.PercivalBpmEstimator(maxBPM=250)
-    dsp["key_extractor"] = es.KeyExtractor()
-    dsp["loudness_extractor"] = es.LoudnessEBUR128()
-    dsp["dynamic_complexity_extractor"] = es.DynamicComplexity()
+#     es = local_es
     
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    global process_executor
+
+    ctx = multiprocessing.get_context("spawn")
+
+    process_executor = ProcessPoolExecutor(max_workers=max(1, os.cpu_count()), 
+#                                           initializer=init_worker_process,
+                                           mp_context=ctx,
+                                           max_tasks_per_child=None)
+
+
     embedding_model_effnet = es.TensorflowPredictEffnetDiscogs(graphFilename="model_weights/discogs-effnet-bs64-1.pb", output="PartitionedCall:1")
     embedding_model_vggish = es.TensorflowPredictVGGish(graphFilename="model_weights/audioset-vggish-3.pb", output="model/vggish/embeddings")
     embedding_models["effnet"] = embedding_model_effnet
@@ -84,18 +88,6 @@ def init_worker_process():
 
     class_labels["mirex"] = ["boisterous", "cheerful", "poignant", "humorous", "aggressive"]
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-
-    global process_executor
-
-    ctx = multiprocessing.get_context("spawn")
-
-    process_executor = ProcessPoolExecutor(max_workers=max(1, os.cpu_count()), 
-                                           initializer=init_worker_process,
-                                           mp_context=ctx,
-                                           max_tasks_per_child=None)
-
 
     yield
 
@@ -104,27 +96,25 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan, dependencies=[Depends(validate_api_key)])
 
 
-def process_single_file(temp_path: str):
-    loader.configure(filename=temp_path)
+def process_dsp(temp_path, temp_dir):
+    loader = es.AudioLoader(filename=temp_path)
+    mono_mixer = es.MonoMixer()
+
     audio_data, native_sr, num_channels, _, _, _ = loader()
     audio = mono_mixer(audio_data, num_channels)
 
     res = dict()
     res["track_id"] = int(temp_path.split("/")[-1].split(".")[0])
     
-
-
-
-    bpm = dsp["bpm_extractor"](audio)
-    key, scale, _ = dsp["key_extractor"](audio)
-    _, _, integrated_loudness, _ = dsp["loudness_extractor"](audio_data)
-    dynamic_complexity, _ = dsp["dynamic_complexity_extractor"](audio)
+    bpm = es.PercivalBpmEstimator(maxBPM=250)(audio)
+    key, scale, _ = es.KeyExtractor()(audio)
+    _, _, integrated_loudness, _ = es.LoudnessEBUR128()(audio_data)
+    dynamic_complexity, _ = es.DynamicComplexity()(audio)
 
     res["bpm"] = bpm
     res["key"] = {"key": key, "scale":scale}
     res["loudness"] = integrated_loudness
     res["dynamic_complexity"] = dynamic_complexity
-
 
     target_sr = 16000
     if native_sr != target_sr:
@@ -136,18 +126,6 @@ def process_single_file(temp_path: str):
         audio_16k = resampler(audio)
     else:
         audio_16k = audio
-
-    embeddings_effnet = embedding_models["effnet"](audio_16k)
-    embeddings_vggish = embedding_models["vggish"](audio_16k)
-
-    res["approachability"] = np.mean(models["approachability"](embeddings_effnet), axis=0)[1].item()
-    res["engagement"] = np.mean(models["engagement"](embeddings_effnet), axis=0)[1].item()
-    res["danceability"] = np.mean(models["danceability"](embeddings_effnet), axis=0)[0].item()
-    res["mood_aggressive"] = np.mean(models["mood_aggressive"](embeddings_effnet), axis=0)[0].item()
-    res["mood_happy"] = np.mean(models["mood_happy"](embeddings_effnet), axis=0)[0].item()
-    res["mood_party"] = np.mean(models["mood_party"](embeddings_effnet), axis=0)[1].item()
-    res["mood_relaxed"] = np.mean(models["mood_relaxed"](embeddings_effnet), axis=0)[1].item()
-    res["mood_sad"] = np.mean(models["mood_sad"](embeddings_effnet), axis=0)[1].item()
 
     left_channel = audio_data[:, 0]
     right_channel = audio_data[:, 1]
@@ -161,8 +139,30 @@ def process_single_file(temp_path: str):
 
     instrumental = True if energy_drop_ratio > 1.0 and num_channels == 2 else False
 
+    res["instrumental"] = instrumental
 
-    if not instrumental:
+
+    data = {"audio": audio_16k, "results": res}
+
+    return data
+
+
+def process_ml(audio_16k, res):
+    embeddings_effnet = embedding_models["effnet"](audio_16k)
+    embeddings_vggish = embedding_models["vggish"](audio_16k)
+
+    res["approachability"] = np.mean(models["approachability"](embeddings_effnet), axis=0)[1].item()
+    res["engagement"] = np.mean(models["engagement"](embeddings_effnet), axis=0)[1].item()
+    res["danceability"] = np.mean(models["danceability"](embeddings_effnet), axis=0)[0].item()
+    res["mood_aggressive"] = np.mean(models["mood_aggressive"](embeddings_effnet), axis=0)[0].item()
+    res["mood_happy"] = np.mean(models["mood_happy"](embeddings_effnet), axis=0)[0].item()
+    res["mood_party"] = np.mean(models["mood_party"](embeddings_effnet), axis=0)[1].item()
+    res["mood_relaxed"] = np.mean(models["mood_relaxed"](embeddings_effnet), axis=0)[1].item()
+    res["mood_sad"] = np.mean(models["mood_sad"](embeddings_effnet), axis=0)[1].item()
+
+
+
+    if not res["instrumental"]:
         voice_preds = models["voice_gender"](embeddings_effnet)
 
         male_probabilities = voice_preds[:, 1] 
@@ -178,7 +178,6 @@ def process_single_file(temp_path: str):
             median_male_prob = np.median(male_probabilities)
             res["voice"] = "male" if median_male_prob > 0.7 else "female"
     
-    res["instrumental"] = instrumental
 
     mtg_mood_predictions = models["moods_mtg"](embeddings_effnet)
     mean_activations = np.mean(mtg_mood_predictions, axis=0)
@@ -204,7 +203,7 @@ def process_single_file(temp_path: str):
 
 
 @app.post("/analyze-batch")
-async def analyze(file: UploadFile):
+def analyze(file: UploadFile):
     if not file.filename.endswith('.zip'):
         raise HTTPException(status_code=400, detail="This endpoint expects a .zip file")
         
@@ -218,7 +217,7 @@ async def analyze(file: UploadFile):
         
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(upload_dir)
-        
+
     supported_extensions = ('.mp3', '.wav', '.flac', '.m4a', '.aac', '.wma')
     audio_paths = [
         str(p) for p in upload_dir.glob("**/*") 
@@ -228,11 +227,16 @@ async def analyze(file: UploadFile):
     if not audio_paths:
         shutil.rmtree(upload_dir)
         raise HTTPException(status_code=400, detail="No valid files in zip archive.")
-        
+
     try:
-        results_iterator = process_executor.map(process_single_file, audio_paths)
-        final_results = list(results_iterator)
-        
+        final_results = []
+        futures = [process_executor.submit(process_dsp, path, upload_dir) for path in audio_paths]
+        dsp_payloads = [f.result() for f in futures]
+
+        for payload in dsp_payloads:
+            ml_predictions = process_ml(payload["audio"], payload["results"])
+            final_results.append(ml_predictions)
+
         return {"status": "success", "results": final_results}
         
     finally:
