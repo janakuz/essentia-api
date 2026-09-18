@@ -64,7 +64,7 @@ async def lifespan(app: FastAPI):
     process_executor = ProcessPoolExecutor(max_workers=max(1, os.cpu_count()), 
                                            initializer=init_worker_process,
                                            mp_context=ctx,
-                                           max_tasks_per_child=None)
+                                           max_tasks_per_child=4)
 
 
     models["approachability"] = es.TensorflowPredict2D(graphFilename="model_weights/approachability_2c-discogs-effnet-1.pb", output="model/Softmax")
