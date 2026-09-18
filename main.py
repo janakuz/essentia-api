@@ -6,6 +6,8 @@ import zipfile
 import shutil
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import queue
+import threading
 import essentia.standard as es
 from dotenv import load_dotenv
 load_dotenv()
@@ -39,14 +41,19 @@ class_labels = dict()
 process_executor = None
 
 
-# def init_worker_process():
-#     global es
-#     import essentia.standard as local_es
-#     import essentia
-#     essentia.EssentiaLogger().warningActive = False
+def init_worker_process():
+    global es
+    import essentia.standard as local_es
+    import essentia
+    essentia.EssentiaLogger().warningActive = False
 
-#     es = local_es
-    
+    es = local_es
+
+    embedding_model_effnet = es.TensorflowPredictEffnetDiscogs(graphFilename="model_weights/discogs-effnet-bs64-1.pb", output="PartitionedCall:1")
+    embedding_model_vggish = es.TensorflowPredictVGGish(graphFilename="model_weights/audioset-vggish-3.pb", output="model/vggish/embeddings")
+    embedding_models["effnet"] = embedding_model_effnet
+    embedding_models["vggish"] = embedding_model_vggish
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
@@ -55,15 +62,10 @@ async def lifespan(app: FastAPI):
     ctx = multiprocessing.get_context("spawn")
 
     process_executor = ProcessPoolExecutor(max_workers=max(1, os.cpu_count()), 
-#                                           initializer=init_worker_process,
+                                           initializer=init_worker_process,
                                            mp_context=ctx,
                                            max_tasks_per_child=None)
 
-
-    embedding_model_effnet = es.TensorflowPredictEffnetDiscogs(graphFilename="model_weights/discogs-effnet-bs64-1.pb", output="PartitionedCall:1")
-    embedding_model_vggish = es.TensorflowPredictVGGish(graphFilename="model_weights/audioset-vggish-3.pb", output="model/vggish/embeddings")
-    embedding_models["effnet"] = embedding_model_effnet
-    embedding_models["vggish"] = embedding_model_vggish
 
     models["approachability"] = es.TensorflowPredict2D(graphFilename="model_weights/approachability_2c-discogs-effnet-1.pb", output="model/Softmax")
     models["engagement"] = es.TensorflowPredict2D(graphFilename="model_weights/engagement_2c-discogs-effnet-1.pb", output="model/Softmax")
@@ -96,7 +98,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan, dependencies=[Depends(validate_api_key)])
 
 
-def process_dsp(temp_path, temp_dir):
+def process_dsp(temp_path):
     loader = es.AudioLoader(filename=temp_path)
     mono_mixer = es.MonoMixer()
 
@@ -141,16 +143,16 @@ def process_dsp(temp_path, temp_dir):
 
     res["instrumental"] = instrumental
 
+    embeddings_effnet = embedding_models["effnet"](audio_16k)
+    embeddings_vggish = embedding_models["vggish"](audio_16k)
 
-    data = {"audio": audio_16k, "results": res}
+
+    data = {"results": res, "embeddings_effnet": embeddings_effnet, "embeddings_vggish": embeddings_vggish}
 
     return data
 
 
-def process_ml(audio_16k, res):
-    embeddings_effnet = embedding_models["effnet"](audio_16k)
-    embeddings_vggish = embedding_models["vggish"](audio_16k)
-
+def process_ml(embeddings_effnet, embeddings_vggish, res):
     res["approachability"] = np.mean(models["approachability"](embeddings_effnet), axis=0)[1].item()
     res["engagement"] = np.mean(models["engagement"](embeddings_effnet), axis=0)[1].item()
     res["danceability"] = np.mean(models["danceability"](embeddings_effnet), axis=0)[0].item()
@@ -206,7 +208,7 @@ def process_ml(audio_16k, res):
 def analyze(file: UploadFile):
     if not file.filename.endswith('.zip'):
         raise HTTPException(status_code=400, detail="This endpoint expects a .zip file")
-        
+
     upload_dir = Path(f"/tmp/zip_{os.getpid()}_{file.filename.replace('.', '_')}")
     upload_dir.mkdir(parents=True, exist_ok=True)
     
@@ -230,12 +232,32 @@ def analyze(file: UploadFile):
 
     try:
         final_results = []
-        futures = [process_executor.submit(process_dsp, path, upload_dir) for path in audio_paths]
-        dsp_payloads = [f.result() for f in futures]
+        ml_queue = queue.Queue()
 
-        for payload in dsp_payloads:
-            ml_predictions = process_ml(payload["audio"], payload["results"])
-            final_results.append(ml_predictions)
+        def ml_consumer():
+            while True:
+                data = ml_queue.get()
+                if data is None:
+                    break
+            
+                ml_predictions = process_ml(data["embeddings_effnet"], data["embeddings_vggish"], data["results"])
+            
+                final_results.append(ml_predictions)
+            ml_queue.task_done()
+
+
+        consumer_thread = threading.Thread(target=ml_consumer)
+        consumer_thread.start()
+
+
+        futures = {process_executor.submit(process_dsp, path): path for path in audio_paths}
+    
+        for future in as_completed(futures):
+            dsp_payload = future.result()
+            ml_queue.put(dsp_payload)
+
+        ml_queue.put(None)
+        consumer_thread.join()
 
         return {"status": "success", "results": final_results}
         
