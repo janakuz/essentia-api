@@ -11,3 +11,8 @@ services:
     volumes:
       - ${HOST_MODELS_PATH}:/app/model_weights:ro
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '8'
+          memory: 16G
